@@ -2,7 +2,7 @@ mod util;
 
 use anyhow::Context;
 use scylla::{prepared_statement::PreparedStatement, QueryResult, Session};
-use shared_types::Inferred;
+use shared_types::{Inferred, Labelled};
 
 pub struct KVStore {
     session: Session,
@@ -21,12 +21,20 @@ impl KVStore {
 
     /// TODO: not happy about exposing QueryResult to callers
     /// Could do result: QueryResult
-    pub async fn write_inference(&self, inf: &Inferred) -> anyhow::Result<()> {
+    pub async fn write_inference(&self, infd: &Inferred) -> anyhow::Result<()> {
         self.session.execute(&self.prep_infer, (
-            inf.id as i64, inf.timestamp, inf.inference.value
+            infd.id as i64, infd.timestamp, infd.inference.value
         )).await?;
         Ok(())
         // .map_err(|e| format!("Error {:?} writing inference {:?}", e, inf))
+    }
+
+    pub async fn write_label(&self, labd: &Labelled) -> anyhow::Result<()> {
+        let labd_str = format!("{:?}", labd.label.value);
+        self.session.execute(&self.prep_label, (
+            labd.id as i64, labd.timestamp, labd_str
+        )).await?;
+        Ok(())
     }
 
     // ----
