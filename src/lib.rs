@@ -1,13 +1,13 @@
 mod util;
 
-use anyhow::Context;
-use scylla::{prepared_statement::PreparedStatement, QueryResult, Session};
+use scylla::{prepared_statement::PreparedStatement, Session};
 use shared_types::{Inferred, Labelled};
 
 pub struct KVStore {
     session: Session,
     prep_infer: PreparedStatement,
     prep_max_label_id: PreparedStatement,
+    prep_label: PreparedStatement,
 }
 
 impl KVStore {
@@ -16,7 +16,8 @@ impl KVStore {
         Self::setup_db(&session).await?;
         let prep_infer = session.prepare(util::INSERT_INFERRED).await?;
         let prep_max_label_id = session.prepare(util::MAX_LABEL_ID).await?;
-        Ok(KVStore { session, prep_infer, prep_max_label_id })
+        let prep_label = session.prepare(util::INSERT_LABELLED).await?;
+        Ok(KVStore { session, prep_infer, prep_max_label_id, prep_label })
     }
 
     /// TODO: not happy about exposing QueryResult to callers
@@ -49,7 +50,7 @@ impl KVStore {
         "#, &[]).await?;
 
         session.query(r#"
-            CREATE TABLE IF NOT EXISTS ml_demo.inference (
+            CREATE TABLE IF NOT EXISTS ml_demo.inferred (
                 id bigint,
                 timestamp bigint,
                 inference float,
@@ -58,7 +59,7 @@ impl KVStore {
         "#, &[]).await?;
 
         session.query(r#"
-            CREATE TABLE IF NOT EXISTS ml_demo.label (
+            CREATE TABLE IF NOT EXISTS ml_demo.labelled (
                 id bigint,
                 version int,
                 timestamp bigint,

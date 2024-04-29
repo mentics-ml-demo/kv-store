@@ -1,4 +1,4 @@
-use scylla::{IntoTypedRows, SerializeRow, FromRow, ValueList, Session, SessionBuilder};
+use scylla::{Session, SessionBuilder};
 
 pub(crate) static INSERT_INFERRED: &str = r#"
     INSERT INTO ml_demo.inference (id, time, inference) VALUES (?, ?, ?);
@@ -12,6 +12,9 @@ pub(crate) static MAX_LABEL_ID: &str = r#"
     SELECT MAX(id) FROM ml_demo.label WHERE version=?
 "#;
 
+pub(crate) static INSERT_LABELLED: &str = r#"
+    INSERT INTO ml_demo.labelled (id, time, inference) VALUES (?, ?, ?);
+"#;
 
 pub(crate) async fn create_session() -> anyhow::Result<Session> {
     let endpoint = std::env::var("SCYLLA_ENDPOINT").unwrap();
