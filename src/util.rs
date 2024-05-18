@@ -5,15 +5,15 @@ pub(crate) static INSERT_INFERRED: &str = r#"
 "#;
 
 pub(crate) static SELECT_INFERRED: &str = r#"
-    SELECT time, inference FROM ml_demo.inference WHERE id=?
+    SELECT time, ml_demo.inference FROM inference WHERE id=?
 "#;
 
 pub(crate) static MAX_LABEL_ID: &str = r#"
-    SELECT MAX(id) FROM ml_demo.label WHERE version=?
+    SELECT MAX(event_id) FROM ml_demo.labelled WHERE version=?
 "#;
 
 pub(crate) static INSERT_LABELLED: &str = r#"
-    INSERT INTO ml_demo.labelled (id, time, inference) VALUES (?, ?, ?);
+    INSERT INTO ml_demo.labelled (version, event_id, timestamp, label) VALUES (?, ?, ?, ?);
 "#;
 
 pub(crate) async fn create_session() -> anyhow::Result<Session> {
