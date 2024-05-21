@@ -1,11 +1,23 @@
 use scylla::{Session, SessionBuilder};
 
-pub(crate) static MAX_LABEL_ID: &str = r#"
-    SELECT MAX(event_id) FROM ml_demo.labelled WHERE version=?
+pub(crate) static INSERT_LABELED: &str = r#"
+    INSERT INTO ml_demo.labeled (version, event_id, timestamp, partition, offset, label) VALUES (?, ?, ?, ?, ?, ?);
 "#;
 
-pub(crate) static INSERT_LABELLED: &str = r#"
-    INSERT INTO ml_demo.labelled (version, event_id, timestamp, label) VALUES (?, ?, ?, ?);
+pub(crate) static NEXT_LABELED: &str = r#"
+    SELECT event_id, timestamp, partition, offset, label FROM ml_demo.labeled WHERE version=? AND event_id > ? ORDER BY event_id ASC LIMIT 1
+"#;
+
+pub(crate) static MAX_LABELED_ID: &str = r#"
+    SELECT MAX(event_id) FROM ml_demo.labeled WHERE version=?
+"#;
+
+pub(crate) static LABELED_BY_ID: &str = r#"
+    SELECT event_id, timestamp, partition, offset, label FROM ml_demo.labeled WHERE version=? AND event_id=?
+"#;
+
+pub(crate) static MAX_TRAINED_ID: &str = r#"
+    SELECT MAX(event_id) FROM ml_demo.trained WHERE version=?
 "#;
 
 pub(crate) static INSERT_TRAINED: &str = r#"
