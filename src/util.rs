@@ -5,7 +5,7 @@ pub(crate) static INSERT_LABELED: &str = r#"
 "#;
 
 pub(crate) static NEXT_LABELED: &str = r#"
-    SELECT event_id, timestamp, partition, offset, label FROM ml_demo.labeled WHERE version=? AND event_id > ? ORDER BY event_id ASC LIMIT 1
+    SELECT event_id, timestamp, partition, offset, label FROM ml_demo.labeled WHERE version=? AND event_id >= ? ORDER BY event_id ASC LIMIT ?
 "#;
 
 pub(crate) static MAX_LABELED_ID: &str = r#"
