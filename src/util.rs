@@ -1,32 +1,40 @@
 use scylla::{Session, SessionBuilder};
 
 pub(crate) static INSERT_LABELED: &str = r#"
-    INSERT INTO ml_demo.labeled (version, event_id, timestamp, partition, offset, label) VALUES (?, ?, ?, ?, ?, ?);
+    INSERT INTO ml_demo.labeled (version, event_id, timestamp, partition, offset_from, offset_to, label) VALUES (?, ?, ?, ?, ?, ?, ?);
 "#;
 
-pub(crate) static NEXT_LABELED: &str = r#"
-    SELECT event_id, timestamp, partition, offset, label FROM ml_demo.labeled WHERE version=? AND event_id >= ? ORDER BY event_id ASC LIMIT ?
-"#;
+// pub(crate) static NEXT_LABELED: &str = r#"
+//     SELECT event_id, timestamp, partition, offset, label FROM ml_demo.labeled WHERE version=? AND event_id >= ? ORDER BY event_id ASC LIMIT ?
+// "#;
 
-pub(crate) static MAX_LABELED_ID: &str = r#"
-    SELECT MAX(event_id) FROM ml_demo.labeled WHERE version=?
+// pub(crate) static MAX_LABELED_ID: &str = r#"
+//     SELECT MAX(event_id) FROM ml_demo.labeled WHERE version=?
+// "#;
+
+pub(crate) static LABEL_MAX: &str = r#"
+    SELECT event_id, timestamp, partition, offset_from, offset_to, label FROM ml_demo.labeled WHERE version=? ORDER BY event_id DESC LIMIT 1
 "#;
 
 pub(crate) static LABELED_BY_ID: &str = r#"
-    SELECT event_id, timestamp, partition, offset, label FROM ml_demo.labeled WHERE version=? AND event_id=?
+    SELECT event_id, timestamp, partition, offset_from, offset_to, label FROM ml_demo.labeled WHERE version=? AND event_id=?
 "#;
 
-pub(crate) static MAX_TRAINED_ID: &str = r#"
-    SELECT MAX(event_id) FROM ml_demo.trained WHERE version=?
-"#;
+// pub(crate) static MAX_TRAINED_ID: &str = r#"
+//     SELECT MAX(event_id) FROM ml_demo.trained WHERE version=?
+// "#;
 
 pub(crate) static INSERT_TRAINED: &str = r#"
-    INSERT INTO ml_demo.trained (version, event_id, timestamp, loss) VALUES (?, ?, ?, ?);
+    INSERT INTO ml_demo.trained (version, event_id, timestamp, partition, offset, loss, input) VALUES (?, ?, ?, ?, ?, ?, ?);
 "#;
 
-pub(crate) static INSERT_INFERRED: &str = r#"
-    INSERT INTO ml_demo.inference (id, time, inference) VALUES (?, ?, ?);
+pub(crate) static SELECT_TRAINED_LOSS: &str = r#"
+    SELECT event_id, timestamp, partition, offset, loss, input FROM ml_demo.trained WHERE version=? ORDER BY loss DESC LIMIT ?
 "#;
+
+// pub(crate) static INSERT_INFERRED: &str = r#"
+//     INSERT INTO ml_demo.inference (id, time, inference) VALUES (?, ?, ?);
+// "#;
 
 // pub(crate) static SELECT_INFERRED: &str = r#"
 //     SELECT time, ml_demo.inference FROM inference WHERE id=?
