@@ -20,7 +20,7 @@ pub struct KVStore {
 }
 
 type LabelStoredRow = (i64, i64, i32, i64, i64, Vec<f32>);
-type TrainStoredRow = (i64, i64, i32, i64, f32, Vec<f32>);
+type TrainStoredRow = (i64, i64, i32, i64, f32, Vec<f32>, Vec<f32>);
 
 // fn tuple_to_labeled(tup: LabelStoredRow) -> anyhow::Result<LabelStored> {
 //     let value = to_arr(tup.4)?;
@@ -125,12 +125,11 @@ impl KVStore {
     // }
 
     pub async fn train_store(&self, trained: TrainStored) -> anyhow::Result<()> {
-        let input_arr: [f32; 2048] = bytemuck::cast(trained.input);
-        let input = input_arr.to_vec();
+        let input = to_model_input_flat(trained.input).to_vec();
         self.session.execute(&self.prep_train, (
             self.version as i32, trained.event_id as i64, trained.timestamp,
             trained.partition, trained.offset,
-            trained.train.loss, input
+            trained.train.loss, input, trained.label.value.to_vec()
         )).await?;
         Ok(())
     }
@@ -174,6 +173,7 @@ impl KVStore {
                 offset bigint,
                 loss float,
                 input frozen<list<float>>,
+                label frozen<list<float>>,
                 PRIMARY KEY(version, loss, event_id)
             ) WITH CLUSTERING ORDER BY (loss DESC, event_id ASC);
         "#, &[]).await?;
@@ -194,4 +194,12 @@ CREATE INDEX loss_index ON ml_demo.trained (version, loss);
 
         Ok(())
     }
+}
+
+pub fn to_model_input(x: ModelInputFlat) -> ModelInput {
+    bytemuck::cast(x)
+}
+
+pub fn to_model_input_flat(x: ModelInput) -> ModelInputFlat {
+    bytemuck::cast(x)
 }

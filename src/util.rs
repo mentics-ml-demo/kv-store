@@ -25,11 +25,11 @@ pub(crate) static LABELED_BY_ID: &str = r#"
 // "#;
 
 pub(crate) static INSERT_TRAINED: &str = r#"
-    INSERT INTO ml_demo.trained (version, event_id, timestamp, partition, offset, loss, input) VALUES (?, ?, ?, ?, ?, ?, ?);
+    INSERT INTO ml_demo.trained (version, event_id, timestamp, partition, offset, loss, input, label) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
 "#;
 
 pub(crate) static SELECT_TRAINED_LOSS: &str = r#"
-    SELECT event_id, timestamp, partition, offset, loss, input FROM ml_demo.trained WHERE version=? ORDER BY loss DESC LIMIT ?
+    SELECT event_id, timestamp, partition, offset, loss, input, label FROM ml_demo.trained WHERE version=? ORDER BY loss DESC LIMIT ?
 "#;
 
 // pub(crate) static INSERT_INFERRED: &str = r#"
