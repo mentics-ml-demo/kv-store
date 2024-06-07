@@ -1,319 +1,183 @@
-// #![feature(slice_flatten)]
+use std::{env, iter::zip, str::FromStr};
+use anyhow::{anyhow,Context};
+use sqlx::{sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool}, Decode, Pool, Sqlite};
 
-mod util;
-
-use std::iter::zip;
-
-use anyhow::{anyhow, bail};
-use convert::to_model_input_flat;
-use scylla::{cql_to_rust::FromRowError, frame::response::result::Row, prepared_statement::PreparedStatement, transport::query_result::SingleRowTypedError, Session};
 use shared_types::*;
-use util::*;
+use convert::*;
 
 pub struct KVStore {
-    version: i32,
-    session: Session,
-
-    prep_label: PreparedStatement,
-    prep_label_max: PreparedStatement,
-    prep_label_by_id: PreparedStatement,
-
-    prep_train_insert: PreparedStatement,
-    prep_train_in_ids: PreparedStatement,
-
-    prep_train_loss_insert: PreparedStatement,
-    prep_train_top_loss: PreparedStatement,
-    prep_train_loss_update: PreparedStatement,
-}
-
-type LabelStoredRow = (i64, i64, i32, i64, i64, Vec<f32>);
-type TrainStoredRow = (i64, i64, i32, i64, Vec<f32>, Vec<f32>);
-type TrainLossStoredRow = (i64, i64, f32);
-// type TrainFullStoredRow = (i64, i64, i32, i64, Vec<f32>, Vec<f32>, f32);
-pub struct TrainFull {
-    pub event_id: EventId,
-    pub timestamp: Timestamp,
-    pub partition: PartitionId,
-    pub offset: OffsetId,
-    pub input_flat: Vec<f32>,
-    pub label_flat: Vec<f32>,
-    pub loss: f32,
-}
-
-
-// fn tuple_to_labeled(tup: LabelStoredRow) -> anyhow::Result<LabelStored> {
-//     let value = to_arr(tup.4)?;
-//     Ok(LabelStored { event_id: tup.0 as u64, timestamp: tup.1, partition: tup.2, offset: tup.3, label: Label { value } })
-//     // tup.4.try_into()
-//     // .map_or_else(
-//     //     |e|   bail!("Failed to convert labeled row to labeled: {:?}", e),
-//     //     |arr: LabelType| )
-//     // )
-// }
-
-// fn tuple_to_label_stored(res_tup: Result<LabelStoredRow,scylla::cql_to_rust::FromRowError>) -> anyhow::Result<LabelStored> {
-fn tuple_to_label_stored(tup: LabelStoredRow) -> anyhow::Result<LabelStored> {
-    // match res_tup {
-    //     Ok(tup) => {
-    //         let value = to_arr(tup.4)?;
-    //         Ok(LabelStored { event_id: tup.0 as u64, timestamp: tup.1, partition: tup.2, offset: tup.3, label: Label { value } })
-    //     },
-    //     Err(e) => {
-    //         bail!("Failed to convert labeled row to labeled: {}", e)
-    //     }
-    // }
-    let value = to_arr(tup.5)?;
-    Ok(LabelStored { event_id: tup.0 as u64, timestamp: tup.1, partition: tup.2, offset_from: tup.3, offset_to: tup.4, label: Label { value } })
-}
-
-fn to_arr<T: std::fmt::Debug, const N: usize>(v: Vec<T>) -> anyhow::Result<[T; N]> {
-    v.try_into().map_err(|e| anyhow!("Failed to convert labeled row arr: {:?}", e))
-    // .map_or_else(
-    //     |e|   bail!("Failed to convert labeled row to labeled: {:?}", e),
-    //     |arr: LabelType| Ok(LabelStored { event_id: tup.0 as u64, timestamp: tup.1, partition: tup.2, offset: tup.3, label: Label { value: arr } })
-    // )
+    version: VersionType,
+    db: Pool<Sqlite>,
 }
 
 impl KVStore {
     pub async fn new(version: VersionType) -> anyhow::Result<KVStore> {
-        let session = create_session().await?;
-        Self::setup_db(&session).await?;
-        let prep_label = session.prepare(INSERT_LABELED).await?;
-        let prep_label_max = session.prepare(LABEL_MAX).await?;
-        let prep_label_by_id = session.prepare(LABELED_BY_ID).await?;
-        let prep_train_insert = session.prepare(INSERT_TRAINED).await?;
-        let prep_train_in_ids = session.prepare(TRAIN_IN_IDS).await?;
-        let prep_train_loss_insert = session.prepare(INSERT_TRAIN_LOSS).await?;
-        let prep_train_top_loss = session.prepare(TRAIN_TOP_LOSS).await?;
-        let prep_train_loss_update = session.prepare(UPDATE_TRAIN_LOSS).await?;
+        let db_url = env::var("DATABASE_URL")?;
+        let options = SqliteConnectOptions::from_str(&db_url)?.journal_mode(SqliteJournalMode::Wal);
+        let db = SqlitePool::connect_with(options).await?;
+        // According to the doc: "When using the high-level query API (sqlx::query), statements are prepared and cached per connection."
+        // So we don't need to store prepared statements.
+        // https://github.com/launchbadge/sqlx/tree/main
 
-        Ok(KVStore { version: version as i32, session,
-            prep_label, prep_label_by_id, prep_label_max,
-            prep_train_insert, prep_train_in_ids,
-            prep_train_loss_insert, prep_train_top_loss, prep_train_loss_update })
+        Ok(Self { version, db })
     }
 
-    pub async fn label_store(&self, labeled: &LabelStored) -> anyhow::Result<()> {
-        self.session.execute(&self.prep_label, (
-            self.version, labeled.event_id as i64, labeled.timestamp,
-            labeled.partition, labeled.offset_from, labeled.offset_to,
-            labeled.label.value.to_vec()
-        )).await?;
-        Ok(())
+    pub async fn label_store(&self, labeled: &LabelStored) -> anyhow::Result<u64> {
+        let output = output_to_bytes(labeled.label.value);
+        let query = sqlx::query!(r#"
+INSERT INTO label (version, event_id, timestamp, offset_from, offset_to, label)
+VALUES (?, ?, ?, ?, ?, ?);
+            "#, self.version, labeled.event_id, labeled.timestamp,
+            labeled.offset_from, labeled.offset_to,
+            output
+        );
+        Ok(query.execute(&self.db).await?.rows_affected())
+        // self.session.execute(&self.prep_label, (
+        //     self.version, labeled.event_id as i64, labeled.timestamp,
+        //     labeled.partition, labeled.offset_from, labeled.offset_to,
+        //     labeled.label.value.to_vec()
+        // )).await?;
+        // Ok(())
     }
 
     pub async fn label_max(&self) -> anyhow::Result<Option<LabelStored>> {
-        match self.session.execute(
-            &self.prep_label_max,
-            (self.version,)).await?
-            .single_row_typed::<LabelStoredRow>() {
-            Ok(row) => {
-                Some(tuple_to_label_stored(row)).transpose()
-            },
-            Err(SingleRowTypedError::BadNumberOfRows(_num_rows)) => {
-                Ok(None)
-            },
-            Err(e) => {
-                bail!("Failed to get label max: {:?}", e)
-            }
-        }
+        let query = sqlx::query_as!(LabelStored, r#"
+SELECT event_id, timestamp, offset_from, offset_to, label
+FROM label
+WHERE version=?
+ORDER BY event_id DESC
+LIMIT 1
+        "#, self.version);
+        query.fetch_optional(&self.db).await.with_context(|| anyhow!("Error getting label max"))
     }
 
-    // pub async fn labeled_next(&self, version: u32, event_id: EventId) -> anyhow::Result<Option<LabelStored>> {
-    //     let row = self.session.execute(&self.prep_labeled_next, (version as i32, event_id as i64)).await?.maybe_first_row_typed::<LabelStoredRow>()?;
-    //     row.map(tuple_to_labeled).transpose()
-    // }
-
-    // pub async fn label_max_event_id(&self, version: u32) -> anyhow::Result<Option<u64>> {
-    //     Ok(self.session
-    //             .execute(&self.prep_labeled_max_id, (version as i32,)).await?
-    //             .maybe_first_row_typed::<(i64,)>()?
-    //             .map(|row| row.0 as u64))
-    // }
-
-    pub async fn label_by_id(&self, version: u32) -> anyhow::Result<Vec<LabelStoredRow>> {
-        Ok(self.session
-                .execute(&self.prep_label_by_id, (version as i32,)).await?
-                .rows_typed::<LabelStoredRow>()?.collect::<Result<Vec<LabelStoredRow>,FromRowError>>()?)
+    pub async fn train_store(&self, train: TrainStored) -> anyhow::Result<u64> {
+        let input = convert::input_to_bytes(train.input);
+        let output = convert::output_to_bytes(train.output);
+        let query = sqlx::query!(r#"
+INSERT INTO train (version, event_id, timestamp, offset, loss, input, output)
+VALUES (?, ?, ?, ?, ?, ?, ?);
+            "#, self.version, train.event_id, train.timestamp, train.offset, train.loss,
+            input, output
+        );
+        Ok(query.execute(&self.db).await.with_context(|| anyhow!("Error storing train"))?.rows_affected())
     }
 
-    // pub async fn max_trained_event_id(&self, version: VersionType) -> anyhow::Result<Option<u64>> {
-    //     Ok(self.session
-    //         .execute(&self.prep_max_train_id, (version as i32,)).await?
-    //         .single_row_typed::<(Option<i64>,)>()?.0
-    //         .map(|id| id as u64))
-    //     // let qr = self.session.execute(&self.prep_max_trained_id, (version as i32,)).await?;
-    //     // Ok(qr.single_row_typed::<(Option<i64>,)>()?.0.map(|x| x as u64))
-    // }
+//     pub async fn train_loss_update(&self, event_id: EventId, new_loss: ModelFloat) -> anyhow::Result<u64> {
+//         let query = sqlx::query!(r#"
+// UPDATE train SET loss = ? WHERE version = ? AND event_id = ?
+//             "#, new_loss, self.version, event_id
+//         );
+//         Ok(query.execute(&self.db).await.with_context(|| anyhow!("Error updating loss"))?.rows_affected())
+//     }
 
-    pub async fn train_store(&self, trained: TrainStored) -> anyhow::Result<()> {
-        let input = to_model_input_flat(trained.input).to_vec();
-        self.session.execute(&self.prep_train_insert, (
-            self.version, trained.event_id as i64, trained.timestamp,
-            trained.partition, trained.offset,
-            input, trained.label.value.to_vec()
-        )).await?;
-        Ok(())
-    }
-
-    async fn train_in_ids(&self, ids: &[i64]) -> anyhow::Result<Vec<TrainStoredRow>> {
-        Ok(self.session
-                .execute(&self.prep_train_in_ids, (
-                    self.version, ids
-                    // ids.iter().map(|id| *id as i64).collect::<Vec<i64>>()
-                )).await?
-                .rows_typed::<TrainStoredRow>()?.collect::<Result<Vec<TrainStoredRow>,FromRowError>>()?)
-    }
-
-    pub async fn train_loss_store(&self, trained: TrainLossStored) -> anyhow::Result<()> {
-        self.session.execute(&self.prep_train_loss_insert, (
-            self.version, trained.event_id as i64, trained.timestamp, trained.loss
-        )).await?;
-        Ok(())
-    }
-
-    pub async fn train_loss_update(&self, event_id: EventId, timestamp: Timestamp, prev_loss: ModelFloat, new_loss: ModelFloat) -> anyhow::Result<()> {
-        // println!("Updating loss from {} to {} for event {}", prev_loss, new_loss, event_id);
-        self.session.execute(&self.prep_train_loss_update, (
-            self.version, prev_loss, event_id as i64, self.version, event_id as i64, timestamp, new_loss
-        )).await?;
-        Ok(())
-    }
-
-    pub async fn train_top_full(&self, count: usize) -> anyhow::Result<Vec<TrainFull>> {
-        let mut top_loss = self.train_top_loss(count).await?;
-        top_loss.sort_unstable_by_key(|row| row.0);
-
-        self.train_full_from_loss(top_loss).await
-    }
-
-    pub async fn train_oldest_full(&self, count: usize) -> anyhow::Result<Vec<TrainFull>> {
-        let mut top_loss = self.train_top_oldest(count).await?;
-        top_loss.sort_unstable_by_key(|row| row.0);
-
-        self.train_full_from_loss(top_loss).await
-    }
-
-    async fn train_full_from_loss(&self, train_loss: Vec<TrainLossStoredRow>) -> Result<Vec<TrainFull>, anyhow::Error> {
-        let (ids, losses): (Vec<_>, Vec<_>) = train_loss.iter().map(|row| (row.0, row.2)).unzip();
-        let trains = self.train_in_ids(&ids).await?;
-        assert!(train_loss.len() == trains.len());
-        for i in 0..train_loss.len() {
-            assert!(ids[i] == trains[i].0)
-        }
-        let res = zip(trains, losses).map(|(train, loss)|
-            TrainFull {
-                event_id: train.0 as EventId, timestamp: train.1,
-                partition: train.2, offset: train.3,
-                input_flat: train.4, label_flat: train.5,
-                loss
-            }
-            // (train.0, train.1, train.2, train.3, train.4, train.5, loss)
-        ).collect::<Vec<_>>();
-        Ok(res)
-    }
-
-    async fn train_top_loss(&self, count: usize) -> anyhow::Result<Vec<TrainLossStoredRow>> {
-        Ok(self.session
-                .execute(&self.prep_train_top_loss, (self.version, count as i32)).await?
-                .rows_typed::<TrainLossStoredRow>()?.collect::<Result<Vec<TrainLossStoredRow>,FromRowError>>()?)
-    }
-
-    async fn train_top_oldest(&self, count: usize) -> anyhow::Result<Vec<TrainLossStoredRow>> {
-        let rows1 = self.session.query("SELECT MIN(timestamp) FROM ml_demo.train_loss", &[]).await?;
-        let row = rows1.single_row()?;
-        let value = match row.columns[0].as_ref() {
-            None => return Ok(vec![]),
-            Some(value) => value
-        };
-
-        let max_timestamp = value.as_bigint().unwrap();
-
-        let rows_raw = self.session.query(format!("SELECT event_id, timestamp, loss FROM ml_demo.train_loss WHERE timestamp <= {} LIMIT {} ALLOW FILTERING", max_timestamp + 10000, 2*count), &[]).await?;
-        // 1717282813489
-        // SELECT event_id, timestamp, loss FROM ml_demo.train_loss WHERE timestamp <= 1717282823489 LIMIT 64 ALLOW FILTERING;
-        let mut rows = rows_raw.rows_typed::<TrainLossStoredRow>()?.collect::<Result<Vec<TrainLossStoredRow>,FromRowError>>()?;
-        rows.sort_unstable_by_key(|row| row.1);
-        if rows.len() < count {
-            println!("WARNING: Not enough rows {} for top oldest for timestamp: {}", rows.len(), max_timestamp);
-        }
-        rows.truncate(count);
-
-        Ok(rows)
-    }
-
-    // ----
-
-    async fn setup_db(session: &Session) -> anyhow::Result<()> {
-        session.query(r#"
-            CREATE KEYSPACE IF NOT EXISTS ml_demo
-            WITH REPLICATION = {
-                'class': 'SimpleStrategy',
-                'replication_factor': 1
-            };
-        "#, &[]).await?;
-
-        session.query(r#"
-            CREATE TABLE IF NOT EXISTS ml_demo.labeled (
-                version int,
-                event_id bigint,
-                timestamp bigint,
-                partition int,
-                offset_from bigint,
-                offset_to bigint,
-                label frozen<list<float>>,
-                PRIMARY KEY(version, event_id)
-            );
-        "#, &[]).await?;
-
-        session.query(r#"
-            CREATE TABLE IF NOT EXISTS ml_demo.trained (
-                version int,
-                event_id bigint,
-                timestamp bigint,
-                partition int,
-                offset bigint,
-                input frozen<list<float>>,
-                label frozen<list<float>>,
-                PRIMARY KEY(version, event_id)
-            );
-        "#, &[]).await?;
-
-        session.query(r#"
-            CREATE TABLE IF NOT EXISTS ml_demo.train_loss (
-                version int,
-                event_id bigint,
-                timestamp bigint,
-                loss float,
-                PRIMARY KEY(version, loss, event_id)
-            ) WITH CLUSTERING ORDER BY (loss DESC, event_id ASC);
-        "#, &[]).await?;
-
-        // session.query(r#"
-        //     CREATE TABLE IF NOT EXISTS ml_demo.inferred (
-        //         id bigint,
-        //         timestamp bigint,
-        //         inference frozen<list<float>>,
-        //         PRIMARY KEY(id)
-        //     );
-        // "#, &[]).await?;
-
-        Ok(())
+    pub async fn retrainers(&self, top_count: i64, old_count: i64) -> anyhow::Result<Vec<TrainStoredWithLabel>> {
+        let query = sqlx::query_as!(TrainStoredWithLabel, r#"
+SELECT train.event_id, train.timestamp, train.offset,
+    train.loss as "loss: f32",
+    input as "input: ModelInputDb",
+    output as "output: ModelOutputDb",
+    label as "label: ModelOutputDb"
+FROM train
+JOIN label ON label.version = train.version AND label.event_id = train.event_id
+WHERE train.version=? AND (
+    train.event_id IN (SELECT event_id FROM train WHERE version=? ORDER BY loss DESC LIMIT ?)
+    OR
+    train.event_id IN (SELECT event_id FROM train WHERE version=? ORDER BY timestamp ASC LIMIT ?)
+)
+            "#, self.version, self.version, top_count, self.version, old_count
+        );
+        query.fetch_all(&self.db).await.with_context(|| anyhow!("Error getting retrainers"))
     }
 
     pub async fn reset_label_data(&self) -> anyhow::Result<()> {
-        self.session.query("TRUNCATE ml_demo.labeled;", &[]).await?;
+        sqlx::query!("DELETE FROM label").execute(&self.db).await?;
         Ok(())
     }
 
     pub async fn reset_train_data(&self) -> anyhow::Result<()> {
-        self.session.query("TRUNCATE ml_demo.trained;", &[]).await?;
-        self.session.query("TRUNCATE ml_demo.train_loss;", &[]).await?;
+        sqlx::query!("DELETE FROM train").execute(&self.db).await?;
         Ok(())
     }
 
-    pub async fn run_query(&self, query: &str) -> anyhow::Result<Vec<Row>> {
-        let result = self.session.query(query, &[]).await?;
-        Ok(result.rows()?)
+    pub async fn label_lookup(&self, start_offset_id: OffsetId, count: usize) -> anyhow::Result<Vec<LabelLookup>> {
+        let cnt = count as i64;
+        let query = sqlx::query_as!(LabelLookup, r#"
+SELECT event_id, offset_from, label as "label: ModelOutputDb"
+FROM label
+WHERE version = ? and offset_from >= ?
+ORDER BY event_id ASC
+limit ?
+            "#, self.version, start_offset_id, cnt);
+        Ok(query.fetch_all(&self.db).await?)
+    }
+
+    /*
+ */
+
+    pub async fn update_losses(&self, event_ids: Vec<i64>, new_losses: Vec<f32>) -> anyhow::Result<u64> {
+        // let values = String::from("VALUES ");
+        let parts: Vec<String> = zip(event_ids, new_losses).map(|(event_id, loss)|
+            format!("({}, {})", event_id, loss)
+        ).collect();
+        let values = parts.join(",");
+
+        let query = format!(r#"
+WITH vals AS (
+    SELECT column1 as event_id, column2 as loss FROM
+    (VALUES {})
+)
+UPDATE train SET loss = vals.loss FROM vals WHERE version = {} AND train.event_id = vals.event_id;
+            "#, values, self.version
+        );
+        let result = sqlx::raw_sql(&query).execute(&self.db).await?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn next_safe_predict_offset(&self) -> anyhow::Result<OffsetId> {
+        let query = sqlx::query!(r#"
+SELECT offset_to as offset
+FROM label
+WHERE version = ? AND event_id = (SELECT MAX(event_id) FROM train WHERE version = ?);
+                "#, self.version, self.version
+        );
+        let x = query.fetch_one(&self.db).await?;
+        Ok(x.offset)
+    }
+}
+
+pub struct LabelLookup {
+    pub event_id: EventId,
+    pub offset_from: OffsetId,
+    pub label: LabelType
+}
+
+struct ModelInputDb(ModelInput);
+struct ModelOutputDb(ModelOutput);
+
+impl sqlx::Decode<'_, sqlx::Sqlite> for ModelInputDb {
+    fn decode(value: <sqlx::Sqlite as sqlx::database::HasValueRef<'_>>::ValueRef) -> Result<Self, sqlx::error::BoxDynError> {
+        let bytes = <&[u8] as Decode<Sqlite>>::decode(value)?;
+        Ok(ModelInputDb(input_from_bytes(bytes)))
+    }
+}
+
+impl From<ModelInputDb> for ModelInput {
+    fn from(value: ModelInputDb) -> Self {
+        value.0
+    }
+}
+
+
+impl sqlx::Decode<'_, sqlx::Sqlite> for ModelOutputDb {
+    fn decode(value: <sqlx::Sqlite as sqlx::database::HasValueRef<'_>>::ValueRef) -> Result<Self, sqlx::error::BoxDynError> {
+        let bytes = <&[u8] as Decode<Sqlite>>::decode(value)?;
+        Ok(ModelOutputDb(output_from_bytes(bytes)))
+    }
+}
+
+impl From<ModelOutputDb> for ModelOutput {
+    fn from(value: ModelOutputDb) -> Self {
+        value.0
     }
 }
