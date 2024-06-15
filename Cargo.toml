@@ -12,3 +12,5 @@ sqlx = { version = "0.7.4", features = ["runtime-tokio", "sqlite"] }
 
 # shared-types = { git = "https://github.com/mentics-online-ml/shared-types.git", branch = "main" }
 shared-types = { path = "../shared-types" }
+hex = "0.4.3"
+itertools = "0.13.0"

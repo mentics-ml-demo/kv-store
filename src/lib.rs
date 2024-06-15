@@ -1,11 +1,12 @@
-use std::{env, iter::zip, str::FromStr};
+use std::{env, str::FromStr};
 use anyhow::{anyhow,Context};
-use chrono_util::{ChronoFeatures, CHRONO_BYTE_SIZE};
-use data_info::{LabelType, Series};
+use itertools::Itertools;
 use sqlx::{sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool}, Decode, Pool, Sqlite};
 
-use shared_types::{*, stored::*};
 use util::convert_slice;
+use chrono_util::{ChronoFeatures, CHRONO_BYTE_SIZE};
+use shared_types::{*, stored::*};
+use data_info::{LabelType, Series};
 
 pub struct KVStore {
     version: VersionType,
@@ -24,7 +25,7 @@ impl KVStore {
         Ok(Self { version, db })
     }
 
-    pub async fn label_store(&self, labeled: &LabelStored) -> anyhow::Result<u64> {
+    pub async fn store_label(&self, labeled: &LabelStored) -> anyhow::Result<u64> {
         // TODO: to_vec might allocate there, we could impl Encode to avoid it maybe
         let output: &[u8] = convert_slice(&labeled.label);
         // println!("Storing label: {}", output.len());
@@ -55,25 +56,33 @@ LIMIT 1
         query.fetch_optional(&self.db).await.with_context(|| anyhow!("Error getting label max"))
     }
 
-    pub async fn train_store(&self, train: TrainStored) -> anyhow::Result<u64> {
-        let input = input_to_bytes(train.input);
-        let output: &[u8] = convert_slice(&train.output[..]);
-        let query = sqlx::query!(r#"
-INSERT INTO train (version, event_id, timestamp, offset, loss, input, output)
-VALUES (?, ?, ?, ?, ?, ?, ?);
-            "#, self.version, train.event_id, train.timestamp, train.offset, train.loss,
-            input, output
-        );
-        Ok(query.execute(&self.db).await.with_context(|| anyhow!("Error storing train"))?.rows_affected())
-    }
-
-//     pub async fn train_loss_update(&self, event_id: EventId, new_loss: ModelFloat) -> anyhow::Result<u64> {
+//     pub async fn train_store(&self, train: TrainStored) -> anyhow::Result<u64> {
+//         let input = input_to_bytes(train.input);
+//         let output: &[u8] = convert_slice(&train.output[..]);
 //         let query = sqlx::query!(r#"
-// UPDATE train SET loss = ? WHERE version = ? AND event_id = ?
-//             "#, new_loss, self.version, event_id
+// INSERT INTO train (version, event_id, timestamp, offset, loss, input, output)
+// VALUES (?, ?, ?, ?, ?, ?, ?);
+//             "#, self.version, train.event_id, train.timestamp, train.offset, train.loss,
+//             input, output
 //         );
-//         Ok(query.execute(&self.db).await.with_context(|| anyhow!("Error updating loss"))?.rows_affected())
+//         Ok(query.execute(&self.db).await.with_context(|| anyhow!("Error storing train"))?.rows_affected())
 //     }
+
+    pub async fn store_trains(&self, trains: Vec<TrainStored>) -> anyhow::Result<u64> {
+        let values = trains.iter().map(|train| {
+            format!("({}, {}, {}, {}, {}, x'{}', x'{}')", self.version, train.event_id, train.timestamp, train.offset, train.loss,
+            input_to_hex(&train.input), label_to_hex(&train.output))
+        }).join(",");
+
+        let query = format!(r#"
+INSERT INTO train (version, event_id, timestamp, offset, loss, input, output)
+VALUES {};
+            "#, values
+        );
+        // println!("store trains query: {}", query);
+        let result = sqlx::raw_sql(&query).execute(&self.db).await?;
+        Ok(result.rows_affected())
+    }
 
     pub async fn retrainers(&self, top_count: i64, old_count: i64) -> anyhow::Result<Vec<TrainStoredWithLabel>> {
         let query = sqlx::query_as!(TrainStoredWithLabel, r#"
@@ -116,23 +125,21 @@ limit ?
         Ok(query.fetch_all(&self.db).await?)
     }
 
-     pub async fn update_losses(&self, timestamp: Timestamp, event_ids: Vec<i64>, new_losses: Vec<f32>) -> anyhow::Result<u64> {
-        // let values = String::from("VALUES ");
-        let parts: Vec<String> = zip(event_ids, new_losses).map(|(event_id, loss)|
-            format!("({}, {})", event_id, loss)
-        ).collect();
-        let values = parts.join(",");
+    pub async fn update_retrainers(&self, cur_time: Timestamp, event_ids: Vec<i64>, outputs: Vec<LabelType>, losses: Vec<f32>) -> anyhow::Result<u64> {
+         let values = event_ids.iter().zip(outputs.iter().zip(losses))
+                .map(|(event_id, (output, loss))|format!("({}, x'{}', {})", event_id, label_to_hex(output), loss)).join(",");
 
         let query = format!(r#"
 WITH vals AS (
-    SELECT column1 as event_id, column2 as loss FROM
+    SELECT column1 as event_id, column2 as output, column3 as loss FROM
     (VALUES {})
 )
-UPDATE train SET loss = vals.loss, timestamp = {} FROM vals WHERE version = {} AND train.event_id = vals.event_id;
-            "#, values, timestamp, self.version
+UPDATE train SET timestamp = {}, output = vals.output, loss = vals.loss FROM vals WHERE version = {} AND train.event_id = vals.event_id;
+            "#, values, cur_time, self.version
         );
-        // println!("query: {}", query);
+        // println!("update retrainers query: {}", query);
         let result = sqlx::raw_sql(&query).execute(&self.db).await?;
+        // println!("Update retrainers modified {} rows", result.rows_affected());
         Ok(result.rows_affected())
     }
 
@@ -147,6 +154,11 @@ WHERE version = ? AND event_id = (SELECT MAX(event_id) FROM train WHERE version 
         Ok(x.offset)
     }
 }
+/*
+SELECT offset_to as offset
+FROM label
+WHERE version = 1 AND event_id = (SELECT MAX(event_id) FROM train WHERE version = 1);
+ */
 
 pub struct LabelLookup {
     pub event_id: EventId,
@@ -194,10 +206,13 @@ impl From<InputStoredDb> for InputStored {
     }
 }
 
-
-fn input_to_bytes((chrono, series): InputStored) -> Vec<u8> {
+fn input_to_hex((chrono, series): &InputStored) -> String {
     // TODO: not sure how efficient this is
-    let s1 = convert_slice(&chrono);
-    let s2 = convert_slice(&series);
-    [s1,s2].concat()
+    let mut s = hex::encode(convert_slice(chrono));
+    s.push_str(&hex::encode(convert_slice(series)));
+    s
+}
+
+fn label_to_hex(label: &LabelType) -> String {
+    hex::encode(convert_slice(label))
 }
